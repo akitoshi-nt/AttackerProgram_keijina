@@ -1,0 +1,478 @@
+//
+// Robot main program
+//           Ver 1.0 Aug.24.2019
+//           By Saeki Akitoshi
+//
+
+//Motor control program
+#include "motorDRV3.h" //  モーター制御のプログラムを読み込む
+#include <Adafruit_NeoPixel.h>
+
+#define PIN            40
+#define NUMPIXELS      16
+Adafruit_NeoPixel strip(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
+
+#include <Wire.h>
+#include <VL53L0X.h>
+
+VL53L0X sensor;
+
+const int ledPin = 13;
+const int StartSW = A14;
+
+const int angle = 19;
+
+const int goal_setup = A6;
+
+//  ラインセンサのピンを設定する
+const int LINE_LED = 10;  //  LINEセンサのLED制御
+const int LINE1D = 22;  //  センサ1のデジタル入力
+const int LINE1A = A0;  //  センサ1のアナログ入力
+const int LINE2D = 23;  //  センサ2のデジタル入力
+const int LINE2A = A1;  //  センサ2のアナログ入力
+const int LINE3D = 24;  //  センサ3のデジタル入力
+const int LINE3A = A2;  //  センサ3のアナログ入力
+const int LINE4D = 25;  //  センサ4のデジタル入力
+const int LINE4A = A3;  //  センサ4のアナログ入力
+
+const int INT_5 = 18;   // Interrupt5
+
+int blob_count, i;
+static int openMV[39];
+static int x_data_ball, y_data_ball, w_data_ball, h_data_ball;
+static int x_data_yellowgoal, y_data_yellowgoal, w_data_yellowgoal, h_data_yellowgoal;
+static int x_data_bluegoal, y_data_bluegoal, w_data_bluegoal, h_data_bluegoal;
+
+static int8_t  gyro;
+static int robot_dir, ball_dir, power;
+
+static int  outofbounds;   // "out of bounds" flag
+
+const uint8_t Drib1 = 40;
+const uint8_t Kick1 = 42;
+
+static int lineflag;//line
+static int line[4];
+
+void setup() {
+
+  strip.begin();
+  strip.show();
+  strip.setBrightness(100);
+
+  pinMode(StartSW, INPUT_PULLUP);
+
+  // IOピンのモード設定
+
+  pinMode(ledPin, OUTPUT);
+
+  pinMode(angle, INPUT);
+
+  pinMode(LINE_LED, OUTPUT);
+  pinMode(LINE1D, INPUT_PULLUP);
+  pinMode(LINE2D, INPUT_PULLUP);
+  pinMode(LINE3D, INPUT_PULLUP);
+  pinMode(LINE4D, INPUT_PULLUP);
+  pinMode(LINE1A, INPUT);
+  pinMode(LINE2A, INPUT);
+  pinMode(LINE3A, INPUT);
+  pinMode(LINE4A, INPUT);
+
+  pinMode(Drib1, OUTPUT);
+  pinMode(Kick1, OUTPUT);
+
+  digitalWrite(Drib1, LOW);
+  digitalWrite(Kick1, LOW);
+
+  // initialize digital pin LED_BUILTIN as an output.
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  pinMode(INT_5, INPUT);          // interrupt port set
+
+  motorInit();  //  モーター制御の初期化
+  power = 10;   //  set initial motor power
+
+  Serial2.begin(19200);  // initialize serialport foe openMV
+  Serial3.begin(115200); // KemarinTech Gyro senser
+
+  lineflag = false;   //reset outofbounds　flag
+  for ( i = 0; i < 4; i++ )
+    line[i] = false;
+  robot_dir = 0;  //reset robot direction
+
+  // Caution D18 -> Interrupt5
+
+  attachInterrupt(5, intHandle, RISING);
+
+  Serial.begin(9600);   //  シリアル出力を初期化
+  Serial.print("Starting...\n");
+
+  //digitalWrite(Kick1, HIGH);
+  //delay(100);
+  //digitalWrite(Kick1, LOW);
+
+  for (int i = 0; i < NUMPIXELS; i++) {
+    strip.setPixelColor(i, strip.Color(100, 100, 100) );
+    strip.show();
+    delay(100); // Delay for a period of time (in milliseconds).
+  }
+
+//digitalWrite(Kick1, HIGH);
+//delay(500);
+//digitalWrite(Kick1, LOW);
+
+  Wire.begin();
+
+  sensor.setTimeout(500);
+  if (!sensor.init())
+  {
+    Serial.println("Failed to detect and initialize sensor!");
+    while (1) {}
+  }
+
+#if defined LONG_RANGE
+  // lower the return signal rate limit (default is 0.25 MCPS)
+  sensor.setSignalRateLimit(0.1);
+  // increase laser pulse periods (defaults are 14 and 10 PCLKs)
+  sensor.setVcselPulsePeriod(VL53L0X::VcselPeriodPreRange, 18);
+  sensor.setVcselPulsePeriod(VL53L0X::VcselPeriodFinalRange, 14);
+#endif
+
+#if defined HIGH_SPEED
+  // reduce timing budget to 20 ms (default is about 33 ms)
+  sensor.setMeasurementTimingBudget(20000);
+#elif defined HIGH_ACCURACY
+  // increase timing budget to 200 ms
+  sensor.setMeasurementTimingBudget(200000);
+#endif
+
+}
+
+void loop() {
+  int level, data;
+  int j;
+  int sig, w, h, area;
+  int bg_w, bg_h, bg_area;
+  int yg_w, yg_h, yg_area;
+  int blocks;
+  int i;
+  char buf[64];
+  float m , z;
+  float x, y;
+  float bg_x, bg_y;
+  float yg_x, yg_y;
+  float goal_x, goal_y;
+  float y_sig, b_sig, goal_sig;
+  int b;
+
+  int pixel;
+  uint32_t color;
+
+  int ball_tof=sensor.readRangeSingleMillimeters();
+
+
+  // check line and reverse
+  blob_count = get_openMV_coordinate();
+  x_data_ball = (openMV[5] & 0b0000000000111111) + ((openMV[6] & 0b0000000000111111) << 6);
+  y_data_ball = (openMV[7] & 0b0000000000111111) + ((openMV[8] & 0b0000000000111111) << 6);
+  w_data_ball = (openMV[9] & 0b0000000000111111) + ((openMV[10] & 0b0000000000111111) << 6);
+  h_data_ball = (openMV[11] & 0b0000000000111111) + ((openMV[12] & 0b0000000000111111) << 6);
+
+  x_data_yellowgoal = (openMV[18] & 0b0000000000111111) + ((openMV[19] & 0b0000000000111111) << 6);
+  y_data_yellowgoal = (openMV[20] & 0b0000000000111111) + ((openMV[21] & 0b0000000000111111) << 6);
+  w_data_yellowgoal = (openMV[22] & 0b0000000000111111) + ((openMV[23] & 0b0000000000111111) << 6);
+  h_data_yellowgoal = (openMV[24] & 0b0000000000111111) + ((openMV[25] & 0b0000000000111111) << 6);
+
+  x_data_bluegoal = (openMV[31] & 0b0000000000111111) + ((openMV[32] & 0b0000000000111111) << 6);
+  y_data_bluegoal = (openMV[33] & 0b0000000000111111) + ((openMV[34] & 0b0000000000111111) << 6);
+  w_data_bluegoal = (openMV[35] & 0b0000000000111111) + ((openMV[36] & 0b0000000000111111) << 6);
+  h_data_bluegoal = (openMV[37] & 0b0000000000111111) + ((openMV[38] & 0b0000000000111111) << 6);
+
+  // get gyro data
+  if (Serial3.available() > 0)
+    while (Serial3.available() != 0) { //  Gyroの方位データをgyroに取り込む
+      gyro = Serial3.read();
+    }
+
+  // openMVのデーターを変換
+
+  sig = openMV[1]; //  openMVのデータをsig,x,y,w,hに取り込む
+  x = x_data_ball;
+  y = y_data_ball;
+  w = w_data_ball;
+  h = h_data_ball;
+  area = w * h;      // 認識したブロックの面積
+  b_sig = openMV[27];
+  bg_x = x_data_bluegoal;
+  bg_y = y_data_bluegoal;
+  bg_w = w_data_bluegoal;
+  bg_h = h_data_bluegoal;
+  bg_area = bg_w * bg_h;      // 認識したブロックの面積
+  y_sig = openMV[14];
+  yg_x = x_data_yellowgoal;
+  yg_y = y_data_yellowgoal;
+  yg_w = w_data_yellowgoal;
+  yg_h = h_data_yellowgoal;
+  yg_area = yg_w * yg_h;      // 認識したブロックの面積
+
+  if (digitalRead(goal_setup)) {
+    goal_sig = b_sig;
+    goal_x = bg_x;
+    goal_y = bg_y;
+    //for ( pixel = 0; pixel < strip.numPixels(); pixel++) {
+    //  strip.setPixelColor(pixel, strip.Color(0, 0, 255));
+    //  strip.show();
+    //}
+  } else {
+    goal_sig = y_sig;
+    goal_x = yg_x;
+    goal_y = yg_y;
+    //for ( pixel = 0; pixel < strip.numPixels(); pixel++) {
+    //  strip.setPixelColor(pixel, strip.Color(255, 241, 0));
+    //  strip.show();
+    //}
+  }
+
+
+  // Convert coordinates data
+  if (sig != 0) {
+    x = 170 - x;
+    y = 117 - y;
+  }
+  if (goal_sig != 0) {
+    goal_x = goal_x - 170 ;
+    goal_y = 110 - goal_y;
+  }
+
+  Serial.print(" Sig=");  //  openMVのデータを出力する
+  Serial.print(sig);
+  Serial.print(" X=");
+  Serial.print(x);
+  Serial.print(" Y=");
+  Serial.print(y);
+  Serial.print(" goal_x=");
+  Serial.print(goal_x);
+  Serial.print(" goal_y=");
+  Serial.print(goal_y);
+  Serial.println();
+  Serial.print("angle=");
+  Serial.print(angle);
+  Serial.println();
+
+
+  Serial.print(gyro);
+  Serial.println();
+  Serial.print(b);
+  Serial.println();
+
+
+  if (digitalRead(StartSW)) {
+    if (digitalRead(angle) == HIGH) {
+      digitalWrite(LINE_LED, LOW);
+    } else {
+      for ( pixel = 0; pixel < strip.numPixels(); pixel++) {
+        strip.setPixelColor(pixel, strip.Color(100, 255, 0));
+        strip.show();
+      }
+
+      digitalWrite(LINE_LED, HIGH); // ラインセンサのLEDを点灯
+
+
+      if (lineflag == true) {
+        lineflag = false;
+      }
+
+      if (abs(gyro) < 20) {
+        digitalWrite(LED_BUILTIN, LOW);
+        if (sensor.readRangeSingleMillimeters() <= 50) {
+          dribbler(100);
+          if ( goal_sig == 0) {
+            //ribbler(100);
+            motorfunction(0, 90, -gyro);
+            for ( pixel = 0; pixel < strip.numPixels(); pixel++) {
+              strip.setPixelColor(pixel, strip.Color(0, 100, 100));
+              strip.show();
+            }
+          } else {
+            if ((goal_y >= 50) && (goal_y <= 80)) {
+              dribbler(100);
+              digitalWrite(Kick1, HIGH);
+              delay(1000);
+              dribbler(0);
+              digitalWrite(Kick1, LOW);
+            } else {
+              dribbler(100);
+              if (abs(goal_x) < 2) {
+                motorfunction(0, 80, -gyro);
+              } else {
+                if(goal_y <= 40){
+                    m = goal_x / goal_y;
+                    z = atan(m) + PI; // arc tangent of m
+                    motorfunction(z, 10 + 20*abs(goal_x), -gyro);
+                    delay(500);
+                }else{
+                  for ( pixel = 0; pixel < strip.numPixels(); pixel++) {
+                    strip.setPixelColor(pixel, strip.Color(100, 120, 90));
+                    strip.show();
+                    m = -(1.5*goal_x) / goal_y;
+                    z = atan(m); // arc tangent of m
+                    motorfunction(z, 10 + 20*abs(goal_x), -gyro);
+                  }
+                }
+              }
+            }
+          }
+        } else {
+          for ( pixel = 0; pixel < strip.numPixels(); pixel++) {
+            strip.setPixelColor(pixel, strip.Color(255, 0, 255));
+            strip.show();
+          }
+          if (sig == 0) {      // No Ball found
+            motorfunction(0, 0, 0);
+          } else {                // Ball find
+            if (y >= 70) {
+              motorfunction(0 , 80, -gyro);
+            } else {
+              if ((abs(x) < 2)&&(y >= 0)) {
+                motorfunction(0 , 30, -gyro);
+                dribbler(100);
+                delay(100);
+              } else {
+                if (y >= 40) {
+                  dribbler(0);
+                  m = y / x;
+                  z = atan(m); // arc tangent of m
+                  motorfunction(z, (abs(x)+abs(y))/2 , -gyro);
+                } else {
+                  if (y < 0) {
+                    if ( y <= 40) {
+                      dribbler(0);
+                      m = y / -(5*x);
+                      z = atan(m) + PI; // arc tangent of m
+                      motorfunction(z, abs(y) + 40, -gyro);
+                    } else {
+                      dribbler(0);
+                      m = y / (2.5*x);
+                      z = atan(m) + PI; // arc tangent of m
+                      motorfunction(z, abs(y) + 40, -gyro);
+                    }
+                  } else {
+                    dribbler(0);
+                    m = 0.5 * y / -x;
+                    z = atan(m) + PI; // arc tangent of m
+                    motorfunction(z, abs(y) + 40, -gyro);
+                  }
+                }
+              }
+            }
+          }
+        }
+      } else {
+        digitalWrite(LED_BUILTIN, HIGH);
+        power = abs(gyro);   //  モーターの速度をgyroにする
+
+        if (gyro > 0) {         // Ball is 1st quadrant
+          turnCCW(power);
+        } else if (gyro < 0) {  // 2nd quadrant
+          turnCCW(-power);
+        } else {
+
+        }
+      }
+    }
+  } else {
+    motorFree();
+    dribbler(0);
+    digitalWrite(LINE_LED, LOW); // ラインセンサのLEDを消灯
+
+    for ( pixel = 0; pixel < strip.numPixels(); pixel++) {
+      strip.setPixelColor(pixel, strip.Color(100, 100, 100));
+      strip.show();
+    }
+  }
+}
+
+int get_openMV_coordinate() { // get the coordinate data of orange ball
+  int i;
+  while (Serial2.available() != 0) { // buffer flush
+    Serial2.read();
+  }
+  while ((openMV[0] = getOpenMV()) != 254); // wait for "254"
+  for (i = 1; i < 39; i++) {
+    openMV[i] = getOpenMV();
+  }
+  return openMV[0];
+}
+
+int getOpenMV() { // get serial data from openMV
+  while (Serial2.available() == 0); // wait for serial data
+  return Serial2.read();
+}
+
+// interrupt handler
+
+void intHandle() {  // Lineを踏んだらlineflagをセットして止まる。
+  int i, power, back_dir;
+  float azimuth;
+
+  if ( !digitalRead(StartSW))  // スイッチがOFFなら何もしない。
+    return;
+
+  power = 40;
+  while (digitalRead(INT_5) == HIGH) {     // Lineセンサが反応している間は繰り返す
+    if (digitalRead(LINE1D) == HIGH) {     // lineを踏んだセンサーを調べる
+      back_Line1(power);        // Lineセンサと反対方向へ移動する
+      lineflag = true;          // set lineflag
+    } else if (digitalRead(LINE2D) == HIGH) {
+      back_Line2(power);
+      lineflag = true;          // set lineflag
+    } else if (digitalRead(LINE3D) == HIGH) {
+      back_Line3(power);
+      lineflag = true;          // set lineflag
+    } else if (digitalRead(LINE4D) == HIGH) {
+      back_Line4(power);
+      lineflag = true;          // set lineflag
+    }
+  }
+  if (lineflag = false)     // センサーの反応がない場合は何もしない
+    return;
+  lineflag = true;          // set lineflag
+  motorStop();                  // ラインから外れたらモーターstop
+  return;
+}
+
+void back_Line1(int power) {             // Lineセンサ1が反応しなくなるまで後ろに進む
+  float azimuth;
+  while ( digitalRead(LINE1D) == HIGH) {
+    azimuth = 4 * 3.14159 / 4.0;   // 後ろ方向(4)をradianに変換
+    motorfunction(azimuth, power, 0);// back_dirの方向に進ませる
+  }
+  motorStop();
+}
+
+void back_Line2(int power) {             // Lineセンサ2が反応しなくなるまで左に進む
+  float azimuth;
+  while ( digitalRead(LINE2D) == HIGH) {
+    azimuth = 6 * 3.14159 / 4.0;   // 左方向(6)をradianに変換
+    motorfunction(azimuth, power, 0);// azimuthの方向に進ませる
+  }
+  motorStop();
+}
+
+void back_Line3(int power) {             // Lineセンサ3が反応しなくなるまで前に進む
+  float azimuth;
+  while ( digitalRead(LINE3D) == HIGH) {
+    azimuth = 0 * 3.14159 / 4.0;   // 前方向(0)をradianに変換
+    motorfunction(azimuth, power, 0);// azimuthの方向に進ませる
+  }
+  motorStop();
+}
+
+void back_Line4(int power) {             // Lineセンサ4が反応しなくなるまで右に進む
+  float azimuth;
+  while ( digitalRead(LINE4D) == HIGH) {
+    azimuth = 2 * 3.14159 / 4.0;   // 右方向()をradianに変換
+    motorfunction(azimuth, power, 0);// azimuthの方向に進ませる
+  }
+  motorStop();
+}
